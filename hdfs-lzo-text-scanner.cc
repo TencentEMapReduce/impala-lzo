@@ -40,6 +40,15 @@ using namespace boost::algorithm;
 using namespace impala;
 using namespace std;
 
+// Workaround to build against Impala before and after move from ScanRange
+// // to io::ScanRange.
+// // TODO: remove this
+#ifdef IMPALA_RUNTIME_IO_DISK_IO_MGR_H
+using namespace impala::io;
+#else
+using ScanRange = ScanRange;
+#endif
+
 DEFINE_bool(disable_lzo_checksums, true,
     "Disable internal checksum checking for Lzo compressed files, defaults true");
 
@@ -141,7 +150,7 @@ Status HdfsLzoTextScanner::GetNextInternal(RowBatch* row_batch) {
 
 Status HdfsLzoTextScanner::LzoIssueInitialRangesImpl(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
-  vector<DiskIoMgr::ScanRange*> header_ranges;
+  vector<ScanRange*> header_ranges;
   // Issue just the header range for each file.  When the header is complete,
   // we'll issue the ranges for that file.  Read the minimum header size plus
   // up to 255 bytes of optional file name.
@@ -152,14 +161,15 @@ Status HdfsLzoTextScanner::LzoIssueInitialRangesImpl(HdfsScanNodeBase* scan_node
     ScanRangeMetadata* metadata =
         reinterpret_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
     int64_t header_size = min(static_cast<int64_t>(HEADER_SIZE), files[i]->file_length);
-    DiskIoMgr::ScanRange* header_range = scan_node->AllocateScanRange(
+    ScanRange* header_range = scan_node->AllocateScanRange(
         files[i]->fs, files[i]->filename.c_str(), header_size, 0, metadata->partition_id,
         -1, false, false, files[i]->mtime);
     header_ranges.push_back(header_range);
   }
   // The files' ranges will be submitted once the header range completes, in
   // IssueFileRanges().  So pass 0 to indicate that no file has been added completely.
-  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges, 0));
+  //LOG(INFO) << "LZO header_ranges.size():" << header_ranges.size();
+  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges));
   return Status::OK();
 }
 
@@ -170,8 +180,9 @@ Status HdfsLzoTextScanner::IssueFileRanges(const char* filename) {
   if (header_->offsets.empty()) {
     // If offsets is empty then there was no index file.  The file cannot be split.
     // If this contains the range starting at offset 0 generate a scan for whole file.
-    const vector<DiskIoMgr::ScanRange*>& splits = file_desc->splits;
-    DiskIoMgr::ScanRange* zero_offset_range = nullptr;
+    const vector<ScanRange*>& splits = file_desc->splits;
+    ScanRange* zero_offset_range = nullptr;
+    vector<ScanRange*> header_ranges;
     for (int j = 0; j < splits.size(); ++j) {
       if (splits[j]->offset() != 0) {
         // There is no index so this file is not splittable. Mark the other initial
@@ -186,14 +197,18 @@ Status HdfsLzoTextScanner::IssueFileRanges(const char* filename) {
       zero_offset_range = scan_node_->AllocateScanRange(
           file_desc->fs, filename, file_desc->file_length, 0, metadata->partition_id,
           -1, false, false, file_desc->mtime);
+      header_ranges.push_back(zero_offset_range);
     }
     // Add the 0-offset range and indicate that the file has no remaining ranges by
     // passing num_files_queued = 1.
     if (zero_offset_range != nullptr) {
+      LOG(INFO) << "LZO zero_offset_range header_ranges.size():" << header_ranges.size();
+      scan_node_->UpdateRemainingScanRangeSubmissions(header_ranges.size());
       scan_node_->AddDiskIoRanges(
-        vector<DiskIoMgr::ScanRange*>(1, zero_offset_range), 1);
+        vector<ScanRange*>(1, zero_offset_range),EnqueueLocation::TAIL);
     }
   } else {
+     LOG(ERROR) << "LZO zero_offset_range != nullptr else";
     scan_node_->AddDiskIoRanges(file_desc);
   }
   return Status::OK();
@@ -587,7 +602,7 @@ Status HdfsLzoTextScanner::ReadAndDecompressData(MemPool* pool) {
     return Status(ss.str());
   }
   // Safe to do because stream_ does not hold tuple data.
-  context_->ReleaseCompletedResources(nullptr, false);
+  context_->ReleaseCompletedResources(false);
   eos_read_ = stream_->eosr();
 
   // Checksum the data.
